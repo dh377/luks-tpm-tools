@@ -1,0 +1,108 @@
+#!/bin/sh
+if [ $(whoami) != "root" ]; then
+  echo "$0 must be run as root!"
+  exit 1
+fi
+
+get_tpm_version() {
+  if [ -f /usr/sbin/tpm_nvread ]; then
+    echo "1"
+    return 1
+  elif [ -f /usr/bin/tpm2_nvread ]; then
+    echo "2"
+    return 2
+  else
+    echo "0"
+    return 0
+  fi
+}
+
+install_v1() {
+  # cp luks-tpm/luks-tpm /usr/sbin
+  # if [ ! -e /etc/default/luks-tpm ]; then cp luks-tpm/default /etc/default/luks-tpm; fi
+  chmod +x key_* tpm.*
+
+  cp key_recovery /usr/sbin
+  cp key_seal /usr/sbin
+  cp key_backup /usr/sbin
+  cp key_read /usr/sbin
+  cp tpm.hook /usr/share/initramfs-tools/hooks/tpm
+  cp tpm.init-premount /usr/share/initramfs-tools/scripts/init-premount/tpm
+}
+
+uninstall_v1() {
+  rm /usr/sbin/key_recovery
+  rm /usr/sbin/key_seal
+  rm /usr/sbin/key_backup
+  rm /usr/sbin/key_read
+  rm /usr/share/initramfs-tools/hooks/tpm
+  rm /usr/share/initramfs-tools/scripts/init-premount/tpm
+}
+
+install_v2() {
+  chmod +x key_* tpm2.*
+
+  cp key_recovery /usr/sbin
+  cp key_seal /usr/sbin
+  cp key_backup /usr/sbin
+  cp key_read /usr/sbin
+  cp tpm2.hook /usr/share/initramfs-tools/hooks/tpm2
+}
+
+uninstall_v2() {
+  rm /usr/sbin/key_recovery
+  rm /usr/sbin/key_seal
+  rm /usr/sbin/key_backup
+  rm /usr/sbin/key_read
+  rm /usr/share/initramfs-tools/hooks/tpm2
+}
+
+install_common() {
+  if [ ! -f /etc/default/luks-tpm-tools ]; then
+    cp default /etc/default/luks-tpm-tools
+  fi
+
+  if ! grep keyscript </etc/crypttab >/dev/null 2>&1; then
+    sed -i 's|none|(keyscript)|;s|$|,keyscript=/usr/sbin/key_read|' /etc/crypttab
+  else
+    sed -i 's|none|(keyscript)|;s|keyscript=\([^,]*\)|keyscript=/usr/sbin/key_read|' /etc/crypttab
+  fi
+
+  update-initramfs -u
+}
+uninstall_common() {
+    if [ "$MODE" = "purge" ]; then
+      rm /etc/default/luks-tpm-tools
+    fi
+
+    sed -i 's|(keyscript)|none|;s|,keyscript=/usr/sbin/key_read||' /etc/crypttab
+}
+
+global_variables() {
+  VERSION=$(get_tpm_version)
+  case "$1" in
+    -u)
+      MODE='uninstall'
+      ;;
+    -p)
+      MODE='purge'
+      ;;
+    *)
+      MODE='install'
+      ;;
+  esac
+}
+
+main() {
+  global_variables "$@"
+
+  if [ $MODE = "install" ]; then
+    (install_v${VERSION})
+    install_common
+  elif [ $MODE = 'uninstall' -o $MODE = 'purge' ]; then
+    (uninstall_v${VERSION})
+    uninstall_common
+  fi
+}
+
+main "$@"

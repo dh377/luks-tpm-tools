@@ -1,0 +1,65 @@
+#!/bin/sh
+PREREQ=""
+prereqs() {
+  echo "$PREREQ"
+}
+case $1 in
+prereqs)
+  prereqs
+  exit 0
+  ;;
+esac
+
+. /usr/share/initramfs-tools/hook-functions
+
+find_libdir() {
+  local libdir=""
+  # find the multiarch lib dir (for example /lib/x86_64-linux-gnu)
+  # by finding a directory with libc.so.6.
+  for d in /lib/$(uname -i)* /lib/* /lib; do
+    for f in "$d"/libnss_files.so.?; do [ -f "$f" ] && break; done
+    [ -f "$f" ] && libdir="$d" && break
+  done
+  echo ${libdir}
+}
+
+add_tss2() {
+  local libdir="$(find_libdir)" lib="" f="" d=""
+  if [ -z "$libdir" ]; then
+    echo "WARNING: no libdir found for adding tss2." 1>&2
+    return
+  fi
+
+  local found=""
+  for lib in libtss2-tcti-device; do
+    found=""
+    for f in "$libdir/$lib.so".?; do
+      [ -e "$f" ] || continue
+      [ "$verbose" = "y" ] && echo "dns: $lib: $f"
+      copy_file library "$f"
+      found="$f"
+    done
+    [ -n "$found" ] || echo "WARNING: no $libdir/$lib.? file" 1>&2
+  done
+  return 0
+}
+
+# add necessary modules
+manual_add_modules tpm_tis tpm_crb
+
+# copy the files to read the NVRAM and to read the secret
+copy_exec "/usr/bin/tpm2_unseal"
+copy_exec "/usr/bin/tpm2_load"
+copy_exec "/usr/bin/tpm2_nvread"
+copy_exec "/usr/bin/tpm2_nvreadlock"
+
+# add tss2 library
+add_tss2
+
+# copy configuration
+copy_file config /etc/default/luks-tpm-tools
+
+# add mountpoint /boot in initramfs
+BOOT_DEV_UUID=$(lsblk -pfln -o UUID,MOUNTPOINT | awk '/boot$/ {print $1}')
+mkdir -p "$DESTDIR/boot"
+echo "/dev/disk/by-uuid/$BOOT_DEV_UUID /boot ext4 defaults,ro 0 2" >>$DESTDIR/etc/fstab

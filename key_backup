@@ -1,0 +1,81 @@
+#!/bin/bash
+if [ $(whoami) != "root" ]; then
+  echo "$0 must be run as root!"
+  exit 1
+fi
+
+# Find first LUKS block device
+find_luks_device() {
+  lsblk -pfln -o NAME,FSTYPE | awk '/crypto_LUKS$/ {print $1}' | head -1
+}
+
+# usage: question "prompt" "default"
+question() {
+  local ANSWER
+  if [ "$1" ]; then
+    echo -n "$1" >&2
+    read -r ANSWER
+  fi
+  echo -n "${ANSWER:-$2}"
+}
+
+# Generate a random key of KEY_SIZE bytes
+generate_keyfile() {
+  if [ -f "${MD}/${KEYFILE_NAME}" ]; then
+    ANSWER=`question "Keyfile found: '${MD}/${KEYFILE_NAME}'. Keep using this? [Y/n] " "y"`
+    if [ $ANSWER = "Y" -o $ANSWER = "y" ]; then
+      return 0
+    fi
+  fi
+  echo "Generating new LUKS key..."
+  if ! (dd bs=${LUKS_KEY_SIZE} count=1 if=/dev/urandom of="${MD}/${KEYFILE_NAME}" >/dev/null 2>&1); then
+    echo "Failed to generate keyfile at ${MD}/${KEYFILE_NAME}"
+    exit 2
+  fi
+}
+
+# Add a key to LUKS
+add_key_luks() {
+  read -r -s -p "Enter any existing LUKS passphrase: " PASSPHRASE
+  echo
+
+  echo "Removing existing key from slot ${LUKS_KEYSLOT_BACKUP}..."
+  echo "${PASSPHRASE}" | cryptsetup luksKillSlot ${LUKS_ROOT_DEVICE} ${LUKS_KEYSLOT_BACKUP}
+
+  echo "Adding new key to slot ${LUKS_KEYSLOT_BACKUP}..."
+  echo "${PASSPHRASE}" | cryptsetup luksAddKey ${LUKS_ROOT_DEVICE} "${MD}/${KEYFILE_NAME}" --key-slot ${LUKS_KEYSLOT_BACKUP}
+}
+
+set_global_variables() {
+  # Meaning of EXIT STATUS
+  TRUE=0
+  FALSE=1
+  DEBUG=$FALSE
+
+  # LUKS (cryptsetup)
+  LUKS_ROOT_DEVICE="$(find_luks_device)"
+  LUKS_KEY_SIZE=32
+  LUKS_KEYSLOT_BACKUP="9"
+
+  KEYFILE_NAME=".keyfile"
+
+  CONFFILE="${CONFFILE:-/etc/default/luks-tpm-tools}"
+  if [ -r "$CONFFILE" ]; then
+    source "$CONFFILE"
+  fi
+
+  if [ -z "$1" ]; then
+    echo "Usage: $ $0 </path/to/keyfile/backup/device/mountpoint>" 1>&2
+    exit 1
+  else
+    MD=$1
+  fi
+}
+
+main() {
+  set_global_variables "$@"
+  generate_keyfile
+  add_key_luks
+}
+
+main "${@}"

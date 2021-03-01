@@ -1,0 +1,83 @@
+#!/usr/sh
+
+## * TPM_PCRS (System tampering detection sensitivity)
+##
+## TPM PCR Measurement descriptions:
+##  0: Core System Firmware executable code (firmware)
+##  1: Core System Firmware data (firmware settings)
+##  2: Extended or pluggable executable code
+##  3: Extended or pluggable firmware data (Set during Boot Device Select UEFI boot phase)
+##  4: Boot Manager (GRUB)
+##  5: GPT / Partition Table
+##  6: Resume from S4 and S5 Power State Events
+##  7: Secure Boot State
+##  8: GRUB: all executed commands (grub_cmd:, kernel_cmdline:, module_cmdline:)
+##  9: GRUB: all readed files (binary)
+## 10: Integrity Measurement Architecture (IMA-measurement)
+## 11: MS Windows BitLocker Access Control
+##
+## Note:
+## 1. PCRS setting is very important to protect your LUKS passphrase. BE CAREFUL
+##    to modifying this option. If a detection level is too low, your passphrase
+##    will be easyly observable. If you do not know or understand this option,
+##    I highly recommend use default setting as is:
+##    **`TPM_PCRS="0,2,4,7,9"`**
+##
+##    In UEFI environment, MS Windows defaultly using 0,2,4,11 (w/o Secure Boot),
+##    7,11 (w/ Secure Boot). PCR 0-7 guarantees the integrity of the kernel,
+##    but does not guarantee the integrity of the boot configuration to unlock
+##    LUKS. This is because the LUKS keyscript is stored and executed in
+##    `initrd.img`, not in the kernel. Therefore, you must include **PCR 9**
+##    instead of PCR 11 which is used in MS Windows, allowing GRUB measures to
+##    ensure tamper-free/integrity of `initrd.img`.
+##
+##    so we have to use PCR 9 instead of BitLocker Access Control PCR(11).
+##    According to this, my recommendation is:
+##    `7,9` (when Secure Boot is on) `0,2,4,9` (Secure Boot not available)
+##
+##    Once `TPM_PCRS` changed, you should also update `initrd.img`.
+##
+## 2. PCR 8,9 measurements are supported only on UEFI platform.
+##    (https://www.gnu.org/software/grub/manual/grub/html_node/Measured-Boot.html)
+##    So you should boot your system on the UEFI environment.
+##
+## 3. PCR 10: IMA-measurement in Ubuntu only include the `boot_aggregate` which
+##    is a SHA1 hash over tpm registers 0-7.
+##
+#TPM_PCRS="0,2,4,7,9"
+
+## If this parameter set empty, encrypted keyfile on bootfs will be used instead of NVRAM.
+# TPM_NVRAM_INDEX="1"
+
+## (TPM v2.0 only)
+# TPM_PCRS_ALGORITHM="sha256"
+# TPM_PARENT_HANDLE="0x81000001"
+
+# * LUKS
+# LUKS_KEY_SIZE=32
+# LUKS_KEYSLOT_SEAL="1"
+# LUKS_KEYSLOT_BACKUP="9"
+
+# LUKS_RECOVERY_KEY_SIZE="22"
+# LUKS_RECOVERY_KEYSLOT="0"
+# LUKS_RECOVERY_KEYSLOT_TEMPORARY="10"
+
+# * Keyfile path (name, ext, location)
+# MOUNTPOINT_RAMFS=/tmp/ramfs
+# MOUNTPOINT_REMOVABLE=/tmp/removable
+# MOUNTPOINT_BOOT=/boot
+
+# KEYFILE_NAME=".keyfile"
+# KEYFILE_EXT_TEMPORARY=".temporary"
+# KEYFILE_EXT_PUBLIC=".public"
+# KEYFILE_EXT_PRIVATE=".private"
+
+# KEYFILE_PUBLIC="${MOUNTPOINT_BOOT}/${KEYFILE_NAME}${KEYFILE_EXT_PUBLIC}"
+# KEYFILE_PRIVATE="${MOUNTPOINT_BOOT}/${KEYFILE_NAME}${KEYFILE_EXT_PRIVATE}"
+# KEYFILE_RAMTMP="${MOUNTPOINT_RAMFS}/${KEYFILE_NAME}${KEYFILE_EXT_TEMPORARY}"
+# KEYFILE_BACKUP="${MOUNTPOINT_REMOVABLE}/${KEYFILE_NAME}"
+
+# RAM_PCR_BINARY="${MOUNTPOINT_RAMFS}/pcr.bin"
+# RAM_POLICY_DIGEST="${MOUNTPOINT_RAMFS}/pol.dig"
+# RAM_PRIMARY_CONTEXT="${MOUNTPOINT_RAMFS}/pri.ctx"
+# RAM_OBJECT_CONTEXT="${MOUNTPOINT_RAMFS}/obj.ctx"

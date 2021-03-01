@@ -1,0 +1,89 @@
+#!/bin/sh 
+PREREQ=""  
+prereqs() 
+{ 
+  echo "$PREREQ" 
+} 
+case $1 in 
+  prereqs) 
+    prereqs 
+    exit 0 
+    ;; 
+esac 
+ 
+. /usr/share/initramfs-tools/hook-functions 
+ 
+find_libdir() {
+  local libdir=""
+  # find the multiarch lib dir (for example /lib/x86_64-linux-gnu)
+  # by finding a directory with libc.so.6.
+  for d in /lib/$(uname -i)* /lib/* /lib; do
+    for f in "$d"/libnss_files.so.?; do [ -f "$f" ] && break; done
+    [ -f "$f" ] && libdir="$d" && break
+  done
+  echo ${libdir}
+}
+
+add_dns() {
+	local nsswitch="${DESTDIR}/etc/nsswitch.conf" lib="" libdir="$(find_libdir)" f="" d=""
+    if [ -z "$libdir" ]; then
+		echo "WARNING: no libdir found for adding dns." 1>&2
+		return
+	fi
+	if ! grep -qs "^hosts:" "$nsswitch"; then
+		echo "hosts: files" >> "$nsswitch"
+	fi
+	local found=""
+	for lib in libnss_files; do
+		found=""
+		for f in "$libdir/$lib.so".?; do
+			[ -e "$f" ] || continue
+			[ "$verbose" = "y" ] && echo "dns: $lib: $f"
+			copy_file library "$f"
+			found="$f"
+		done
+		[ -n "$found" ] || echo "WARNING: no $libdir/$lib.? file" 1>&2
+	done
+	return 0
+}
+
+# add necessary kernel module
+# manual_add_modules tpm_tis
+
+# copy the necessary libraries 
+add_dns  # file based dns
+
+# copy the daemon + config in the initrd 
+copy_exec /usr/sbin/tcsd
+copy_exec /etc/tcsd.conf
+
+# copy the tpm configuration 
+mkdir -p "$DESTDIR/var/lib/tpm" 
+cp /var/lib/tpm/* "$DESTDIR/var/lib/tpm/" 
+ 
+#copy the files to read the NVRAM and to read the secret  
+copy_exec /usr/sbin/tpm_nvread
+copy_exec /usr/bin/tpm_unsealdata 
+copy_exec /usr/sbin/tpm_nvinfo 
+copy_exec /usr/sbin/key_read
+
+# copy configuration
+copy_file config /etc/default/luks-tpm-tools
+
+#create etc/passwd
+groupid=`id -G tss`
+userid=`id -u tss`
+# echo "root:x:0:0:root:/root:/bin/bash" >  ${DESTDIR}/etc/passwd
+echo "tss:x:$userid:$groupid::/var/lib/tpm:/bin/false" >> ${DESTDIR}/etc/passwd
+
+#create etc/hosts
+printf "127.0.0.1 localhost\n::1 localhost ip6-localhost ip6-loopback\nff02::1 ip6-allnodes\nff02::2 ip6-allrouters\n" > ${DESTDIR}/etc/hosts
+
+#create etc/group
+# echo "root:x:0:" > ${DESTDIR}/etc/group
+echo "tss:x:$groupid:" >> ${DESTDIR}/etc/group
+
+# add mountpoint /boot in initramfs
+BOOT_DEV_UUID=$(lsblk -pfln -o UUID,MOUNTPOINT | awk '/boot$/ {print $1}')
+mkdir -p "$DESTDIR/boot"
+echo "/dev/disk/by-uuid/$BOOT_DEV_UUID /boot ext4 defaults,ro 0 2" >> $DESTDIR/etc/fstab

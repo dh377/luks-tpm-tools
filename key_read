@@ -1,0 +1,436 @@
+#!/bin/sh
+
+detect_io_interfaces() {
+  # is plymouth available? default false
+  PLYMOUTH=$FALSE
+  if [ -x /bin/plymouth ] && plymouth --ping; then
+    PLYMOUTH=$TRUE
+  fi
+
+  # is usplash available? default false
+  USPLASH=$FALSE
+  # test for outfifo from Ubuntu Hardy cryptroot script, the second test
+  # alone proves not completely reliable.
+  if [ -p /dev/.initramfs/usplash_outfifo -a -x /sbin/usplash_write ]; then
+    # use innocuous command to determine if usplash is running
+    # usplash_write will return exit-code 1 if usplash isn't running
+    # need to set a flag to tell usplash_write to report no usplash
+    FAIL_NO_USPLASH=1
+    # enable verbose messages (required to display messages if kernel boot option "quiet" is enabled
+    /sbin/usplash_write "VERBOSE on"
+    if [ $? -eq $TRUE ]; then
+      # usplash is running
+      USPLASH=$TRUE
+      /sbin/usplash_write "CLEAR"
+    fi
+  fi
+
+  # is stty available? default false
+  STTY=$FALSE
+  STTYCMD=false
+  # check for stty executable
+  if [ -x /bin/stty ]; then
+    STTY=$TRUE
+    STTYCMD=/bin/stty
+  elif [ $( (
+    busybox stty >/dev/null 2>&1
+    echo $?
+  )) -eq $TRUE ]; then
+    STTY=$TRUE
+    STTYCMD="busybox stty"
+  fi
+}
+
+# print message to usplash or stderr
+# usage: msg <command> "message" [switch]
+# command: TEXT | STATUS | SUCCESS | FAILURE | CLEAR (see 'man usplash_write' for all commands)
+# switch : switch used for echo to stderr (ignored for usplash)
+# when using usplash the command will cause "message" to be
+# printed according to the usplash <command> definition.
+# using the switch -n will allow echo to write multiple messages
+# to the same line
+msg() {
+  if [ $# -gt 0 ]; then
+    # handle multi-line messages
+    echo $2 | while read LINE; do
+      if [ $PLYMOUTH -eq $TRUE ]; then
+        # use plymouth
+        plymouth message --text="$LINE"
+      elif [ $USPLASH -eq $TRUE ]; then
+        # use usplash
+        /sbin/usplash_write "STATUS                                "
+        /sbin/usplash_write "CLEAR"
+        /sbin/usplash_write "$1 $LINE"
+        /sbin/usplash_write "VERBOSE default"
+      else
+        # use stderr for all messages
+        echo $3 "$2" >&2
+      fi
+    done
+  fi
+}
+
+dbg() {
+  if [ $DEBUG -eq $TRUE ]; then
+    msg "$@"
+  fi
+}
+
+# read password from console or with usplash
+# usage: readpass "prompt"
+readpass() {
+  if [ $# -gt 0 ]; then
+    if [ $PLYMOUTH -eq $TRUE ]; then
+      PASS="$(plymouth ask-for-password --prompt "$1")"
+    elif [ $USPLASH -eq $TRUE ]; then
+      usplash_write "INPUTQUIET $1"
+      PASS="$(cat /dev/.initramfs/usplash_outfifo)"
+    else
+      [ $STTY -ne $TRUE ] && msg TEXT "WARNING stty not found, password will be visible"
+      echo -n "$1" >&2
+      $STTYCMD -echo
+      read -r PASS </dev/console >/dev/null
+      [ $STTY -eq $TRUE ] && echo >&2
+      $STTYCMD echo
+    fi
+  fi
+  echo -n "$PASS"
+}
+
+# Create a temporary in-memory file system to store key files
+create_ramfs() {
+  mkdir -p "${MOUNTPOINT_RAMFS}"
+  if ! mount ramfs "${MOUNTPOINT_RAMFS}" -t ramfs -o size=1m; then
+    echo "Could not create tmpfs. Aborting..." >&2
+    exit 3
+  fi
+  chmod 700 "${MOUNTPOINT_RAMFS}"
+}
+
+# Remove the temporary in-memory file system
+destroy_ramfs() {
+  for f in "$(find ${MOUNTPOINT_RAMFS}/* 2>/dev/null)"; do
+    dd if=/dev/urandom of="${f}" bs=$(busybox stat -c %s "${f}" 2>/dev/null) count=1 conv=notrunc >/dev/null 2>&1
+    rm -f "${f}"
+  done
+  umount "${MOUNTPOINT_RAMFS}"
+}
+
+#! only for reference
+open_keyfile_from_existing_mount() {
+  if [ $OPENED -eq $TRUE ]; then return; fi
+  if [ -f "$KEYFILE_NAME" ]; then
+    # If the file already exists use it.
+    # This is useful where an encrypted volume contains LUKS key(s) for later
+    # volumes and is now mounted and accessible
+    dbg TEXT "Found $KEYFILE_NAME"
+    cat $KEYFILE_NAME
+    OPENED=$TRUE
+    DEV="existing mount"
+    SFS="existing mount"
+    LABEL="$KEYFILE_NAME"
+  fi
+}
+
+open_keyfile_from_tpm() {
+  if [ $OPENED -eq $TRUE ]; then return; fi
+  local OPEN_OUTPUT OPEN_STATUS
+
+  dbg STATUS "Creating RAMFS ..."
+  create_ramfs
+
+  if [ -n "$TPM_NVRAM_INDEX" ]; then
+    LABEL="NVRAM:${TPM_NVRAM_INDEX}"
+    if [ $_TPM_VERSION = "1" ]; then
+      dbg STATUS "Reading TPM:NVRAM:${TPM_NVRAM_INDEX} (PCRs:$TPM_PCRS) ..."
+      tcsd && sleep 1
+      OPEN_OUTPUT=$(tpm_nvread -i ${TPM_NVRAM_INDEX} -f "${KEYFILE_RAMTMP}" 2>&1)
+      OPEN_STATUS=$?
+      if [ $OPEN_STATUS = $TRUE -a $_RUNNING_IN_INITRAMFS = $TRUE ]; then
+        dbg STATUS "Disabling TPM:NVRAM:${TPM_NVRAM_INDEX} ..."
+        tcsd && sleep 1
+        tpm_nvread -i ${TPM_NVRAM_INDEX} -s 0 >/dev/null 2>&1
+      fi
+    elif [ $_TPM_VERSION = "2" ]; then
+      dbg STATUS "Reading TPM:NVRAM:${TPM_NVRAM_INDEX} (PCRs:$TPM_PCRS) ..."
+      OPEN_OUTPUT=$(tpm2_nvread -P "pcr:$TPM_PCRS_ARG" -o "$KEYFILE_RAMTMP" "$TPM_NVRAM_INDEX" 2>&1)
+      OPEN_STATUS=$?
+      if [ $OPEN_STATUS = $TRUE -a $_RUNNING_IN_INITRAMFS = $TRUE ]; then
+        dbg STATUS "Disabling TPM:NVRAM:${TPM_NVRAM_INDEX} ..."
+        tpm2_nvreadlock -P "pcr:$TPM_PCRS_ARG" "$TPM_NVRAM_INDEX" >/dev/null 2>&1
+      fi
+    fi
+  else
+    LABEL="$KEYFILE_SEALED"
+    mount $MOUNTPOINT_BOOT
+    if [ -f "$KEYFILE_SEALED" ]; then
+      dbg STATUS "Found Sealed LUKS key."
+      if [ $_TPM_VERSION = "1" ]; then
+        tcsd && sleep 1
+        tpm_unsealdata -i "${KEYFILE_SEALED}" -o "${KEYFILE_RAMTMP}" -z >/dev/null 2>&1
+      elif [ $_TPM_VERSION = "2" ]; then
+        tpm2_load -C $TPM_PARENT_HANDLE -r "$KEYFILE_PRIVATE" -u "$KEYFILE_PUBLIC" -c "$RAM_OBJECT_CONTEXT" >/dev/null 2>&1
+        tpm2_unseal -c "$RAM_OBJECT_CONTEXT" -o "$KEYFILE_RAMTMP" -p "pcr:$TPM_PCRS_ARG" >/dev/null 2>&1
+      fi
+    fi
+    OPEN_STATUS=$?
+    umount $MOUNTPOINT_BOOT
+  fi
+
+  if [ $OPEN_STATUS -gt 0 ]; then
+    if [ $_RUNNING_IN_INITRAMFS = $TRUE ]; then
+      dbg STATUS "oepn_keyfile_from_tpm: ERROR ($OPEN_STATUS)"
+    else
+      if (echo "${OPEN_OUTPUT}" | grep "0x00000008" >/dev/null) || (echo "${OPEN_OUTPUT}" | grep "0x148" >/dev/null); then
+        # TrouSerS: TPM_E_DISABLED_CMD (The target command has been disabled)
+        # tpm2-tss: TPM2_RC_NV_LOCKED (NV access locked.)
+        msg STATUS "Info: keyfile saved in TPM:$LABEL is working at boot (locked now)."
+      elif (echo "${OPEN_OUTPUT}" | grep "0x00000018" >/dev/null) || (echo "${OPEN_OUTPUT}" | grep "0x99D" >/dev/null); then
+        # TrouSerS: TPM_E_WRONGPCRVAL (The named PCR value does not match the current PCR value.)
+        # tpm2-tss: TPM2_RC_POLICY_FAIL (a policy check failed)
+        msg STATUS "Warn: $LABEL: PCRS changed ($TPM_PCRS). Run 'key_seal'"
+      else
+        msg STATUS "${OPEN_OUTPUT}"
+        msg STATUS "oepn_keyfile_from_tpm: $LABEL: ERROR ($OPEN_STATUS)"
+      fi
+    fi
+    rm -f "${KEYFILE_RAMTMP}"
+  fi
+
+  if [ -f "${KEYFILE_RAMTMP}" ]; then
+    [ $_RUNNING_IN_INITRAMFS = $TRUE ] && cat ${KEYFILE_RAMTMP}
+    OPENED=$TRUE
+    DEV="tpm"
+    SFS="TPM"
+  fi
+
+  dbg STATUS "Destroying RAMFS ..."
+  destroy_ramfs
+}
+
+open_keyfile_from_removable() {
+  if [ $OPENED -eq $TRUE ]; then return; fi
+
+  # Is the USB driver loaded?
+  cat /proc/modules | busybox grep usb_storage >/dev/null 2>&1
+  USBLOAD=0$?
+  if [ $USBLOAD -gt 0 ]; then
+    dbg TEXT "Loading driver 'usb_storage'"
+    modprobe usb_storage >/dev/null 2>&1
+  fi
+
+  # Is the MMC (SDcard) driver loaded?
+  cat /proc/modules | busybox grep mmc >/dev/null 2>&1
+  MMCLOAD=0$?
+  if [ $MMCLOAD -gt 0 ]; then
+    dbg TEXT "Loading drivers 'mmc_block' and 'sdhci'"
+    modprobe mmc_block >/dev/null 2>&1
+    modprobe sdhci >/dev/null 2>&1
+  fi
+
+  USB_LOADED=$FALSE
+
+  mkdir -p $MOUNTPOINT_REMOVABLE
+  dbg TEXT "Trying to get LUKS key '$KEYFILE_NAME' ..."
+  for SECONDS_SLEPT in $(seq 1 1 $MAX_SECONDS); do
+    for SDB in $(ls -d /sys/block/sd* /sys/block/mmc* 2>/dev/null); do
+      dbg TEXT "Examining $SDB" -n
+      # is it a USB device?
+      (cd ${SDB}/device && busybox pwd) | busybox grep 'usb\|mmc' >/dev/null 2>&1
+      USB=0$?
+      dbg TEXT ", USB/MMC=$USB" -n
+      if [ $USB -ne $TRUE -o ! -f $SDB/dev ]; then
+        dbg TEXT ", device $(busybox basename $SDB) ignored"
+        continue # for SDB
+      fi
+      USB_LOADED=$TRUE
+
+      for SFS in $(ls -d $SDB/$(busybox basename $SDB)* $SDB 2>/dev/null); do
+        dbg TEXT ", *possible key device*" -n
+        DEV=$(busybox basename $SFS)
+        # Check if key device itself is encrypted
+        /sbin/cryptsetup isLuks /dev/${DEV} >/dev/null 2>&1
+        ENCRYPTED=0$?
+        DECRYPTED=$FALSE
+        # Open crypted partition and prepare for mount
+        if [ $ENCRYPTED -eq $TRUE ]; then
+          dbg TEXT ", encrypted device" -n
+          # Use blkid to determine label
+          LABEL=$(/sbin/blkid -s LABEL -o value /dev/${DEV})
+          dbg TEXT ", label $LABEL" -n
+          TRIES=3
+          DECRYPTED=$FALSE
+          while [ $TRIES -gt 0 -a $DECRYPTED -ne $TRUE ]; do
+            TRIES=$(($TRIES - 1))
+            prompt="Enter LUKS password for key device ${DEV} (${LABEL}) (or empty to skip): "
+            PASS=$(readpass "$prompt")
+            if [ -z "$PASS" ]; then
+              dbg TEXT ", device skipped" -n
+              break
+            fi
+            echo $PASS | /sbin/cryptsetup luksOpen /dev/${DEV} bootkey >/dev/null 2>&1
+            DECRYPTED=0$?
+          done
+          # If open failed, skip this device
+          if [ $DECRYPTED -ne $TRUE ]; then
+            dbg TEXT "decrypting device failed" -n
+            break
+          fi
+          # Decrypted device to use
+          DEV=mapper/bootkey
+        else
+          DECRYPTED=$TRUE
+        fi
+        dbg TEXT ", device $DEV" -n
+        # Use blkid to determine label
+        LABEL=$(/sbin/blkid -s LABEL -o value /dev/${DEV})
+        dbg TEXT ", label $LABEL" -n
+        # Use blkid to determine fstype
+        FSTYPE=$(/sbin/blkid -s TYPE -o value /dev/${DEV})
+        dbg TEXT ", fstype $FSTYPE" -n
+        # Is the file-system driver loaded?
+        cat /proc/modules | busybox grep $FSTYPE >/dev/null 2>&1
+        FSLOAD=0$?
+        if [ $FSLOAD -gt 0 ]; then
+          dbg TEXT ", loading driver for $FSTYPE" -n
+          # load the correct file-system driver
+          modprobe $FSTYPE >/dev/null 2>&1
+        fi
+        dbg TEXT ", mounting /dev/$DEV on $MOUNTPOINT_REMOVABLE" -n
+        if ! (mount -t $FSTYPE -o ro /dev/${DEV} $MOUNTPOINT_REMOVABLE 2>/dev/null); then
+          mount /dev/${DEV} ${MOUNTPOINT_REMOVABLE} 2>/dev/null
+        fi
+        dbg TEXT ", ($(mount | busybox grep $DEV))" -n
+        dbg TEXT ", checking for $KEYFILE_BACKUP" -n
+        if [ -f $KEYFILE_BACKUP ]; then
+          dbg TEXT ", found $KEYFILE_BACKUP" -n
+          [ $_RUNNING_IN_INITRAMFS = $TRUE ] && cat $KEYFILE_BACKUP
+          OPENED=$TRUE
+        fi
+        dbg TEXT ", umount $MOUNTPOINT_REMOVABLE" -n
+        umount $MOUNTPOINT_REMOVABLE >/dev/null 2>&1
+        # Close encrypted key device
+        if [ $ENCRYPTED -eq $TRUE -a $DECRYPTED -eq $TRUE ]; then
+          dbg TEXT ", closing encrypted device" -n
+          /sbin/cryptsetup luksClose bootkey >/dev/null 2>&1
+        fi
+        dbg TEXT ", done"
+        if [ $OPENED -eq $TRUE ]; then
+          break
+        fi
+        dbg CLEAR ""
+      done
+      # if we found the LUKS key on one device, we don't want to process any more
+      if [ $OPENED -eq $TRUE ]; then
+        break
+      fi
+    done
+    # didn't find the LUKS key, if USB is loaded we must give up, otherwise sleep for a second
+    if [ $USB_LOADED -eq $TRUE ]; then
+      dbg TEXT "USB/MMC Device found in less than ${SECONDS_SLEPT}s"
+      break
+    elif [ $SECONDS_SLEPT -ne $MAX_SECONDS ]; then
+      dbg TEXT "USB/MMC Device not found yet, sleeping for 1s and trying again"
+      sleep 1
+    else
+      dbg TEXT "USB/MMC Device not found, giving up after ${MAX_SECONDS}s... (increase MAX_SECONDS?)"
+    fi
+  done
+}
+
+set_global_variables() {
+  # define counter-intuitive shell logic values (based on /bin/true & /bin/false)
+  # NB. use FALSE only to *set* something to false, but don't test for
+  # equality, because a program might return any non-zero on error
+  TRUE=0
+  FALSE=1
+
+  # set DEBUG=$TRUE to display debug messages, DEBUG=$FALSE to be quiet
+  DEBUG=$FALSE
+
+  # maximum time to sleep waiting for devices to become ready before
+  # asking for passphrase
+  MAX_SECONDS=2
+
+  TPM_PCRS="0,2,4,7,9"
+  TPM_NVRAM_INDEX="1"
+  TPM_PCRS_ALGORITHM="sha256"
+  TPM_PARENT_HANDLE="0x81000001"
+
+  # Keyfile path (name, ext, location)
+  MOUNTPOINT_RAMFS=/tmp/ramfs
+  MOUNTPOINT_REMOVABLE=/tmp/removable
+  MOUNTPOINT_BOOT=/boot
+
+  KEYFILE_NAME=".keyfile"
+  KEYFILE_EXT_TEMPORARY=".temporary"
+  KEYFILE_EXT_PUBLIC=".public"
+  KEYFILE_EXT_PRIVATE=".private"
+
+  KEYFILE_PUBLIC="${MOUNTPOINT_BOOT}/${KEYFILE_NAME}${KEYFILE_EXT_PUBLIC}"
+  KEYFILE_PRIVATE="${MOUNTPOINT_BOOT}/${KEYFILE_NAME}${KEYFILE_EXT_PRIVATE}"
+  KEYFILE_RAMTMP="${MOUNTPOINT_RAMFS}/${KEYFILE_NAME}${KEYFILE_EXT_TEMPORARY}"
+  KEYFILE_BACKUP="${MOUNTPOINT_REMOVABLE}/${KEYFILE_NAME}"
+
+  RAM_OBJECT_CONTEXT="${MOUNTPOINT_RAMFS}/obj.ctx"
+
+  CONFFILE="${CONFFILE:-/etc/default/luks-tpm-tools}"
+  if [ -r "$CONFFILE" ]; then
+    . "$CONFFILE"
+  fi
+
+  _TPM_VERSION=$(get_tpm_version)
+
+  TPM_PCRS=`printf '%s\n' "$TPM_PCRS" | sed 's/ //g'`
+  if [ $_TPM_VERSION = "1" ]; then
+    TPM_PCRS_ARG=`printf '%s\n' "-r$TPM_PCRS" | sed 's/,/ -r/g'`
+  elif [ $_TPM_VERSION = "2" ]; then
+    TPM_PCRS_ARG="${TPM_PCRS_ALGORITHM}:${TPM_PCRS}"
+  fi
+
+  _RUNNING_IN_INITRAMFS=$([ "$1" = "(keyscript)" ]; echo $?)
+}
+
+get_tpm_version() {
+  if [ -f /usr/sbin/tpm_nvread ]; then
+    echo "1"
+    return 1
+  elif [ -f /usr/bin/tpm2_nvread ]; then
+    echo "2"
+    return 2
+  else
+    echo "0"
+    return 0
+  fi
+}
+
+main() {
+  set_global_variables "$@"
+  detect_io_interfaces
+  dbg STATUS "Executing keyscript ..."
+
+  # flag tracking keyfile availability
+  OPENED=$FALSE
+
+  open_keyfile_from_tpm
+  open_keyfile_from_removable
+
+  # clear existing usplash text and status messages
+  if [ $_RUNNING_IN_INITRAMFS = $TRUE ]; then
+    if [ $OPENED = $TRUE ]; then
+      dbg TEXT "Success loading LUKS key from $SFS ($LABEL)"
+      msg TEXT "Unlocking the disk $CRYPTTAB_SOURCE ($CRYPTTAB_NAME)"
+    else
+      dbg TEXT "Failed to find LUKS key ..."
+      readpass "Please unlock $CRYPTTAB_SOURCE as $CRYPTTAB_NAME"
+    fi
+  else
+    if [ $OPENED = $TRUE ]; then
+      msg TEXT "Success loading LUKS key from $SFS ($LABEL)"
+    else
+      msg TEXT "Failed to find LUKS key."
+    fi
+  fi
+}
+
+main "$@"

@@ -1,0 +1,97 @@
+#!/bin/bash
+if [ $(whoami) != "root" ]; then
+  echo "$0 must be run as root!"
+  exit 1
+fi
+
+# Create a temporary in-memory file system to store key files
+create_ramfs() {
+  mkdir -p "${MOUNTPOINT_RAMFS}"
+  if ! mount ramfs "${MOUNTPOINT_RAMFS}" -t ramfs -o size=1m; then
+    echo "Could not create tmpfs. Aborting..." >&2
+    exit 3
+  fi
+  chmod 700 "${MOUNTPOINT_RAMFS}"
+}
+
+# Remove the temporary in-memory file system
+destroy_ramfs() {
+  for f in "$(find ${MOUNTPOINT_RAMFS}/* 2>/dev/null)"; do
+    dd if=/dev/urandom of="${f}" bs=$(busybox stat -c %s "${f}" 2>/dev/null) count=1 conv=notrunc >/dev/null 2>&1
+    rm -f "${f}"
+  done
+  umount "${MOUNTPOINT_RAMFS}"
+}
+
+# Find first LUKS block device
+find_luks_device() {
+  lsblk -pfln -o NAME,FSTYPE | awk '/crypto_LUKS$/ {print $1}' | head -1
+}
+
+generate_recovery_key() {
+  local LONG_HEX LONG_DEC
+  LONG_HEX=$(dd bs=$LUKS_RECOVERY_KEY_SIZE count=1 if=/dev/urandom of=/dev/stdout 2>/dev/null | hexdump -v -e '/1  "%02X"')
+  LONG_DEC=$(echo "obase=10;ibase=16;$LONG_HEX" | bc)
+  HUMAN_READABLE_RECOVERY_KEY=$(echo ${LONG_DEC/$'\\\n'/} | grep -o ......)
+  printf "%s" ${HUMAN_READABLE_RECOVERY_KEY//$'\n'/} >${KEYFILE_RAMTMP}
+  # hexdump -C <${KEYFILE_RAMTMP}
+  HUMAN_READABLE_RECOVERY_KEY=${HUMAN_READABLE_RECOVERY_KEY//$'\n'/-}
+}
+
+# Add a key to LUKS
+add_key_luks() {
+  read -r -s -p "Enter any existing LUKS passphrase: " PASSPHRASE
+  echo
+
+  echo "${PASSPHRASE}" | cryptsetup luksKillSlot ${ROOT_DEVICE} ${LUKS_RECOVERY_KEYSLOT_TEMPORARY} 2>/dev/null
+  if ! (echo "${PASSPHRASE}" | cryptsetup luksAddKey ${ROOT_DEVICE} ${KEYFILE_RAMTMP} --key-slot ${LUKS_RECOVERY_KEYSLOT_TEMPORARY}); then
+    return
+  fi
+  echo
+  printf "+=========================================================+\n"
+  printf "| %-55s |\n" "Your NEW RECOVERY PASSPHRASE is:"
+  printf "| %55s |\n" $HUMAN_READABLE_RECOVERY_KEY
+  printf "+=========================================================+\n\n"
+  printf "VERIFY NEW RECOVERY PASSPHRASE; Before completing verification,\nyour password will NOT write in LUKS.\n"
+  if cryptsetup luksOpen --test-passphrase ${ROOT_DEVICE} --key-slot ${LUKS_RECOVERY_KEYSLOT_TEMPORARY}; then
+    echo "Adding new key to slot ${LUKS_RECOVERY_KEYSLOT}..."
+    cat "${KEYFILE_RAMTMP}" | cryptsetup luksKillSlot ${ROOT_DEVICE} ${LUKS_RECOVERY_KEYSLOT}
+    cat "${KEYFILE_RAMTMP}" | cryptsetup luksAddKey ${ROOT_DEVICE} ${KEYFILE_RAMTMP} --key-slot ${LUKS_RECOVERY_KEYSLOT}
+    echo "Succefully verified and written in LUKS."
+    cat "${KEYFILE_RAMTMP}" | cryptsetup luksKillSlot ${ROOT_DEVICE} ${LUKS_RECOVERY_KEYSLOT_TEMPORARY}
+  else
+    echo "Failed to verify. Nothing changed."
+    echo "${PASSPHRASE}" | cryptsetup luksKillSlot ${ROOT_DEVICE} ${LUKS_RECOVERY_KEYSLOT_TEMPORARY}
+  fi
+}
+
+set_global_variables() {
+  # Meaning of EXIT STATUS
+  TRUE=0
+  FALSE=1
+  DEBUG=$FALSE
+
+  LUKS_ROOT_DEVICE="$(find_luks_device)"
+  LUKS_RECOVERY_KEY_SIZE="22"
+  LUKS_RECOVERY_KEYSLOT="0"
+  LUKS_RECOVERY_KEYSLOT_TEMPORARY="10"
+
+  MOUNTPOINT_RAMFS=/tmp/ramfs
+  KEYFILE_NAME=".keyfile"
+  KEYFILE_RAMTMP="${MOUNTPOINT_RAMFS}/${KEYFILE_NAME}${KEYFILE_EXT_TEMPORARY}"
+
+  CONFFILE="${CONFFILE:-/etc/default/luks-tpm-tools}"
+  if [ -r "$CONFFILE" ]; then
+    source "$CONFFILE"
+  fi
+}
+
+main() {
+  set_global_variables
+  create_ramfs
+  generate_recovery_key
+  add_key_luks
+  destroy_ramfs
+}
+
+main "${@}"

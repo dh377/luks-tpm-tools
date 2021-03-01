@@ -1,0 +1,317 @@
+#!/bin/bash
+if [ $(whoami) != "root" ]; then
+  echo "$0 must be run as root!"
+  exit 1
+fi
+
+# Create a temporary in-memory file system to store key files
+create_ramfs() {
+  mkdir -p "${MOUNTPOINT_RAMFS}"
+  if ! mount -t ramfs -o size=1m ramfs "${MOUNTPOINT_RAMFS}"; then
+    echo "Could not create tmpfs. Aborting..." >&2
+    exit 3
+  fi
+  chmod 700 "${MOUNTPOINT_RAMFS}"
+}
+
+# Remove the temporary in-memory file system
+destroy_ramfs() {
+  for f in "$(find ${MOUNTPOINT_RAMFS}/* 2>/dev/null)"; do
+    dd if=/dev/urandom of="${f}" bs=$(busybox stat -c %s "${f}" 2>/dev/null) count=1 conv=notrunc >/dev/null 2>&1
+    rm -f "${f}"
+  done
+  dbg TEXT "umount ${MOUNTPOINT_RAMFS}"
+  umount "${MOUNTPOINT_RAMFS}"
+}
+
+# Find first LUKS block device
+find_luks_device() {
+  lsblk -pfln -o NAME,FSTYPE | awk '/crypto_LUKS$/ {print $1}' | head -1
+}
+
+# Generate a random key of LUKS_KEY_SIZE bytes
+generate_keyfile() {
+  echo "Generating new LUKS key..."
+  dd bs=${LUKS_KEY_SIZE} count=1 if=/dev/urandom of="${KEYFILE_RAMTMP}" >/dev/null 2>&1
+}
+
+msg() {
+  if [ $# -gt 0 ]; then
+    echo $2 | while read LINE; do
+      echo $3 "$2" >&2
+    done
+  fi
+}
+
+dbg() {
+  if [ $DEBUG -eq 0 ]; then
+    msg "$@"
+  fi
+}
+
+# read password from console or with usplash
+# usage: readpass "prompt"
+readpass() {
+  if [ $# -gt 0 ]; then
+    if [ $PLYMOUTH -eq $TRUE ]; then
+      PASS="$(plymouth ask-for-password --prompt "$1")"
+    elif [ $USPLASH -eq $TRUE ]; then
+      usplash_write "INPUTQUIET $1"
+      PASS="$(cat /dev/.initramfs/usplash_outfifo)"
+    else
+      [ $STTY -ne $TRUE ] && msg TEXT "WARNING stty not found, password will be visible"
+      echo -n "$1" >&2
+      $STTYCMD -echo
+      read -r PASS </dev/console >/dev/null
+      [ $STTY -eq $TRUE ] && echo >&2
+      $STTYCMD echo
+    fi
+  fi
+  echo -n "$PASS"
+}
+
+get_passphrase_from_usb() {
+  OPENED=$FALSE
+  mkdir -p $MOUNTPOINT_REMOVABLE
+  dbg TEXT "Trying to get '${KEYFILE_NAME}' ..."
+  for SDB in $(ls -d /sys/block/sd* /sys/block/mmc* 2>/dev/null); do
+    dbg TEXT "Examining $SDB" -n
+    # is it a USB device?
+    (cd ${SDB}/device && busybox pwd) | busybox grep 'usb\|mmc' >/dev/null 2>&1
+    USB=0$?
+    dbg TEXT ", USB/MMC=$USB" -n
+    if [ $USB -ne $TRUE -o ! -f $SDB/dev ]; then
+      dbg TEXT ", device $(busybox basename $SDB) ignored"
+      continue # for SDB
+    fi
+    USB_LOADED=0
+
+    for SFS in $(ls -d $SDB/$(busybox basename $SDB)* $SDB 2>/dev/null); do
+      dbg TEXT ", *possible key device*" -n
+      DEV=$(busybox basename $SFS)
+      # Check if key device itself is encrypted
+      /sbin/cryptsetup isLuks /dev/${DEV} >/dev/null 2>&1
+      ENCRYPTED=0$?
+      DECRYPTED=$FALSE
+      # Open crypted partition and prepare for mount
+      if [ $ENCRYPTED -eq $TRUE ]; then
+        dbg TEXT ", encrypted device" -n
+        # Use blkid to determine label
+        LABEL=$(blkid -s LABEL -o value /dev/${DEV})
+        dbg TEXT ", label $LABEL" -n
+        TRIES=3
+        DECRYPTED=1
+        while [ $TRIES -gt 0 -a $DECRYPTED -ne 0 ]; do
+          TRIES=$(($TRIES - 1))
+          prompt="Enter LUKS password for key device ${DEV} (${LABEL}) (or empty to skip): "
+          PASS=$(readpass "$prompt")
+          if [ -z "$PASS" ]; then
+            dbg TEXT ", device skipped" -n
+            break
+          fi
+          echo $PASS | /sbin/cryptsetup luksOpen /dev/${DEV} bootkey >/dev/null 2>&1
+          DECRYPTED=0$?
+        done
+        # If open failed, skip this device
+        if [ $DECRYPTED -ne 0 ]; then
+          dbg TEXT "decrypting device failed" -n
+          break
+        fi
+        # Decrypted device to use
+        DEV=mapper/bootkey
+      else
+        DECRYPTED=0
+      fi
+      dbg TEXT ", device $DEV" -n
+      # Use blkid to determine label
+      LABEL=$(/sbin/blkid -s LABEL -o value /dev/${DEV})
+      dbg TEXT ", label $LABEL" -n
+      # Use blkid to determine fstype
+      FSTYPE=$(/sbin/blkid -s TYPE -o value /dev/${DEV})
+      dbg TEXT ", fstype $FSTYPE" -n
+      # Is the file-system driver loaded?
+      cat /proc/modules | busybox grep $FSTYPE >/dev/null 2>&1
+      FSLOAD=0$?
+      if [ $FSLOAD -gt 0 ]; then
+        dbg TEXT ", loading driver for $FSTYPE" -n
+        # load the correct file-system driver
+        modprobe $FSTYPE >/dev/null 2>&1
+      fi
+      dbg TEXT ", mounting /dev/$DEV on $MOUNTPOINT_REMOVABLE" -n
+      if ! (mount -t $FSTYPE -o ro /dev/${DEV} $MOUNTPOINT_REMOVABLE 2>/dev/null); then
+        mount /dev/${DEV} ${MOUNTPOINT_REMOVABLE} 2>/dev/null
+      fi
+      dbg TEXT ", ($(mount | busybox grep ${MOUNTPOINT_REMOVABLE}))" -n
+      dbg TEXT ", checking for ${KEYFILE_BACKUP}" -n
+      if [ -f ${KEYFILE_BACKUP} ]; then
+        dbg TEXT ", found ${KEYFILE_BACKUP}" -n
+        cat ${KEYFILE_BACKUP}
+        OPENED=0
+      fi
+      dbg TEXT ", umount $MOUNTPOINT_REMOVABLE" -n
+      umount $MOUNTPOINT_REMOVABLE >/dev/null 2>&1
+      # Close encrypted key device
+      if [ $ENCRYPTED -eq $TRUE -a $DECRYPTED -eq $TRUE ]; then
+        dbg TEXT ", closing encrypted device" -n
+        /sbin/cryptsetup luksClose bootkey >/dev/null 2>&1
+      fi
+      dbg TEXT ", done"
+      if [ $OPENED -eq $TRUE ]; then
+        break
+      fi
+      dbg CLEAR ""
+    done
+    # if we found the keyfile on one device, we don't want to process any more
+    if [ $OPENED -eq $TRUE ]; then
+      break
+    fi
+  done
+}
+
+# Add a key to LUKS
+add_key_luks() {
+  local PASSPHRASE
+
+  PASSPHRASE=$(get_passphrase_from_usb)
+  if [ -z $PASSPHRASE ]; then
+    read -r -s -p "Enter any existing LUKS passphrase: " PASSPHRASE
+    echo
+  fi
+
+  echo "Removing existing key from slot ${LUKS_KEYSLOT_SEAL}..."
+  echo "${PASSPHRASE}" | cryptsetup luksKillSlot ${LUKS_ROOT_DEVICE} ${LUKS_KEYSLOT_SEAL}
+  KILLED="$?"
+  if [ $KILLED = $TRUE ]; then
+    echo "Adding new key to slot ${LUKS_KEYSLOT_SEAL}..."
+    echo "${PASSPHRASE}" | cryptsetup luksAddKey ${LUKS_ROOT_DEVICE} "${KEYFILE_RAMTMP}" --key-slot ${LUKS_KEYSLOT_SEAL}
+  fi
+  return $KILLED
+}
+
+seal_key_tpm() {
+  if [ $_TPM_VERSION = "2" ]; then
+    # Get PCR Policy
+    tpm2_pcrread -o "${RAM_PCR_BINARY}" "${TPM_PCRS_ARG}" >/dev/null
+    tpm2_createpolicy --policy-pcr -f "${RAM_PCR_BINARY}" -l "${TPM_PCRS_ARG}" -L "${RAM_POLICY_DIGEST}" >/dev/null
+  fi
+
+  if [ -n "${TPM_NVRAM_INDEX}" ]; then
+    echo "Storing key in TPM NVRAM:${TPM_NVRAM_INDEX} (PCRs:$TPM_PCRS)..."
+    if [ $_TPM_VERSION = "1" ]; then
+      # Lock NVRAM indices when sealing them to PCRs
+      # ref: https://sourceforge.net/p/trousers/mailman/message/32332373/
+      # tpm_nvdefine -z -i 0xFFFFFFFF -s 0
+      tpm_nvrelease -i "${TPM_NVRAM_INDEX}" -y
+      tpm_nvdefine -i "${TPM_NVRAM_INDEX}" -p 'OWNERWRITE|READ_STCLEAR' -s "${LUKS_KEY_SIZE}" -y -z ${TPM_PCRS_ARG}
+      tpm_nvwrite -i "${TPM_NVRAM_INDEX}" -f "${KEYFILE_RAMTMP}" -z      
+    elif [ $_TPM_VERSION = "2" ]; then
+      # NV Indexes
+      # tpm2_getcap handles-nv-index
+      tpm2_nvundefine "${TPM_NVRAM_INDEX}" >/dev/null 2>&1
+      tpm2_nvdefine -L "${RAM_POLICY_DIGEST}" -s ${LUKS_KEY_SIZE} -a "policyread|policywrite|read_stclear" "$TPM_NVRAM_INDEX" >/dev/null
+      tpm2_nvwrite -P "pcr:${TPM_PCRS_ARG}" -i "${KEYFILE_RAMTMP}" "${TPM_NVRAM_INDEX}" >/dev/null
+    fi
+  else
+    echo "Sealing keyfile with TPM ..."
+    if [ $_TPM_VERSION = "1" ]; then
+      rm -f "${KEYFILE_ENCRYPTED}"
+      tpm_sealdata -z -i "${KEYFILE_RAMTMP}" -o "${KEYFILE_ENCRYPTED}" ${PCRS}
+      chmod 600 "${KEYFILE_ENCRYPTED}"
+    elif [ $_TPM_VERSION = "2" ]; then
+      # To remove persistent handle in the TPM:
+      # tpm2_evictcontrol -c ${TPM_PARENT_HANDLE}
+      if ! (tpm2_getcap handles-persistent | grep ${TPM_PARENT_HANDLE} >/dev/null); then
+        tpm2_createprimary -c ${RAM_PRIMARY_CONTEXT} >/dev/null
+        tpm2_evictcontrol -c ${RAM_PRIMARY_CONTEXT} ${TPM_PARENT_HANDLE} >/dev/null
+      fi
+      tpm2_create -C "${TPM_PARENT_HANDLE}" -a 'fixedtpm|fixedparent|adminwithpolicy|noda' -i "${KEYFILE_RAMTMP}" -L "$RAM_POLICY_DIGEST" -r "$KEYFILE_PRIVATE" -u "$KEYFILE_PUBLIC" >/dev/null
+    fi
+  fi
+  retval=$?
+  if [ $retval -eq $TRUE ]; then
+    echo "Done."
+  else
+    echo "Failed."
+  fi
+  return $retval
+}
+
+get_tpm_version() {
+  if [ -f /usr/sbin/tpm_nvread ]; then
+    echo "1"
+    return 1
+  elif [ -f /usr/bin/tpm2_nvread ]; then
+    echo "2"
+    return 2
+  else
+    echo "0"
+    return 0
+  fi
+}
+
+set_global_variables() {
+  # Meaning of EXIT STATUS
+  TRUE=0
+  FALSE=1
+  DEBUG=$FALSE
+
+  # LUKS (cryptsetup)
+  LUKS_ROOT_DEVICE="$(find_luks_device)"
+  LUKS_KEY_SIZE=32
+  LUKS_KEYSLOT_SEAL="1"
+
+  # TPM2 (tpm2-tools)
+  TPM_PCRS="0,2,4,7,9"
+  TPM_NVRAM_INDEX="1"
+  
+  # TPM2 only
+  TPM_PCRS_ALGORITHM="sha256"
+  TPM_PARENT_HANDLE="0x81000001"
+
+  # Keyfile path (name, ext, location)
+  MOUNTPOINT_RAMFS=/tmp/ramfs
+  MOUNTPOINT_REMOVABLE=/tmp/removable
+  MOUNTPOINT_BOOT=/boot
+
+  KEYFILE_NAME=".keyfile"
+  KEYFILE_EXT_TEMPORARY=".temporary"
+  KEYFILE_EXT_ENCRYPTED=".encrypted"
+  KEYFILE_EXT_PUBLIC=".public"
+  KEYFILE_EXT_PRIVATE=".private"
+
+  KEYFILE_RAMTMP="${MOUNTPOINT_RAMFS}/${KEYFILE_NAME}${KEYFILE_EXT_TEMPORARY}"
+  KEYFILE_ENCRYPTED="${MOUNTPOINT_RAMFS}/${KEYFILE_NAME}${KEYFILE_EXT_ENCRYPTED}"
+  KEYFILE_PUBLIC="${MOUNTPOINT_BOOT}/${KEYFILE_NAME}${KEYFILE_EXT_PUBLIC}"
+  KEYFILE_PRIVATE="${MOUNTPOINT_BOOT}/${KEYFILE_NAME}${KEYFILE_EXT_PRIVATE}"
+  KEYFILE_BACKUP="${MOUNTPOINT_REMOVABLE}/${KEYFILE_NAME}"
+
+  RAM_PRIMARY_CONTEXT="${MOUNTPOINT_RAMFS}/pri.ctx"
+  RAM_PCR_BINARY="${MOUNTPOINT_RAMFS}/pcr.bin"
+  RAM_POLICY_DIGEST="${MOUNTPOINT_RAMFS}/pol.dig"
+
+  CONFFILE="${CONFFILE:-/etc/default/luks-tpm-tools}"
+  if [ -r "$CONFFILE" ]; then
+    source "$CONFFILE"
+  fi
+
+  _TPM_VERSION=$(get_tpm_version)
+  if [ $_TPM_VERSION = "1" ]; then
+    TPM_PCRS_ARG="-r${TPM_PCRS//,/ -r}"
+  elif [ $_TPM_VERSION = "2" ]; then
+    TPM_PCRS_ARG="${TPM_PCRS_ALGORITHM}:${TPM_PCRS}"
+  fi
+}
+
+main() {
+  set_global_variables
+  create_ramfs
+
+  generate_keyfile
+  if add_key_luks; then
+    seal_key_tpm
+  fi
+
+  destroy_ramfs
+}
+
+main "${@}"

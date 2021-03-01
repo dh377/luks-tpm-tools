@@ -1,0 +1,14 @@
+#!/bin/sh 
+ 
+# configure the tpm 
+# chown tss:tss /dev/tpm0 
+# chmod 600 /dev/tpm0
+
+if [ -f /usr/bin/ifconfig ]; then 
+  ifconfig lo up 
+fi
+
+# start tcsd 
+# if [ -f /sbin/tcsd ]; then 
+#   /sbin/tcsd 
+# fi 
