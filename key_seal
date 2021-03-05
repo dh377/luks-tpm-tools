@@ -180,11 +180,8 @@ add_key_luks() {
 
   echo "Removing existing key from slot ${LUKS_KEYSLOT_SEAL}..."
   echo "${PASSPHRASE}" | cryptsetup luksKillSlot ${LUKS_ROOT_DEVICE} ${LUKS_KEYSLOT_SEAL}
-  KILLED="$?"
-  if [ $KILLED = $TRUE ]; then
-    echo "Adding new key to slot ${LUKS_KEYSLOT_SEAL}..."
-    echo "${PASSPHRASE}" | cryptsetup luksAddKey ${LUKS_ROOT_DEVICE} "${KEYFILE_RAMTMP}" --key-slot ${LUKS_KEYSLOT_SEAL}
-  fi
+  echo "Adding new key to slot ${LUKS_KEYSLOT_SEAL}..."
+  echo "${PASSPHRASE}" | cryptsetup luksAddKey ${LUKS_ROOT_DEVICE} "${KEYFILE_RAMTMP}" --key-slot ${LUKS_KEYSLOT_SEAL}
   return $KILLED
 }
 

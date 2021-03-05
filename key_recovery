@@ -43,8 +43,8 @@ add_key_luks() {
   read -r -s -p "Enter any existing LUKS passphrase: " PASSPHRASE
   echo
 
-  echo "${PASSPHRASE}" | cryptsetup luksKillSlot ${ROOT_DEVICE} ${LUKS_RECOVERY_KEYSLOT_TEMPORARY} 2>/dev/null
-  if ! (echo "${PASSPHRASE}" | cryptsetup luksAddKey ${ROOT_DEVICE} ${KEYFILE_RAMTMP} --key-slot ${LUKS_RECOVERY_KEYSLOT_TEMPORARY}); then
+  echo "${PASSPHRASE}" | cryptsetup luksKillSlot ${LUKS_ROOT_DEVICE} ${LUKS_RECOVERY_KEYSLOT_TEMPORARY} 2>/dev/null
+  if ! (echo "${PASSPHRASE}" | cryptsetup luksAddKey "${LUKS_ROOT_DEVICE}" "${KEYFILE_RAMTMP}" --key-slot ${LUKS_RECOVERY_KEYSLOT_TEMPORARY}); then
     return
   fi
   echo
@@ -53,15 +53,15 @@ add_key_luks() {
   printf "| %55s |\n" $HUMAN_READABLE_RECOVERY_KEY
   printf "+=========================================================+\n\n"
   printf "VERIFY NEW RECOVERY PASSPHRASE; Before completing verification,\nyour password will NOT write in LUKS.\n"
-  if cryptsetup luksOpen --test-passphrase ${ROOT_DEVICE} --key-slot ${LUKS_RECOVERY_KEYSLOT_TEMPORARY}; then
+  if cryptsetup luksOpen --test-passphrase ${LUKS_ROOT_DEVICE} --key-slot ${LUKS_RECOVERY_KEYSLOT_TEMPORARY}; then
     echo "Adding new key to slot ${LUKS_RECOVERY_KEYSLOT}..."
-    cat "${KEYFILE_RAMTMP}" | cryptsetup luksKillSlot ${ROOT_DEVICE} ${LUKS_RECOVERY_KEYSLOT}
-    cat "${KEYFILE_RAMTMP}" | cryptsetup luksAddKey ${ROOT_DEVICE} ${KEYFILE_RAMTMP} --key-slot ${LUKS_RECOVERY_KEYSLOT}
+    cat "${KEYFILE_RAMTMP}" | cryptsetup luksKillSlot ${LUKS_ROOT_DEVICE} ${LUKS_RECOVERY_KEYSLOT}
+    cat "${KEYFILE_RAMTMP}" | cryptsetup luksAddKey ${LUKS_ROOT_DEVICE} ${KEYFILE_RAMTMP} --key-slot ${LUKS_RECOVERY_KEYSLOT}
     echo "Succefully verified and written in LUKS."
-    cat "${KEYFILE_RAMTMP}" | cryptsetup luksKillSlot ${ROOT_DEVICE} ${LUKS_RECOVERY_KEYSLOT_TEMPORARY}
+    cat "${KEYFILE_RAMTMP}" | cryptsetup luksKillSlot ${LUKS_ROOT_DEVICE} ${LUKS_RECOVERY_KEYSLOT_TEMPORARY}
   else
     echo "Failed to verify. Nothing changed."
-    echo "${PASSPHRASE}" | cryptsetup luksKillSlot ${ROOT_DEVICE} ${LUKS_RECOVERY_KEYSLOT_TEMPORARY}
+    echo "${PASSPHRASE}" | cryptsetup luksKillSlot ${LUKS_ROOT_DEVICE} ${LUKS_RECOVERY_KEYSLOT_TEMPORARY}
   fi
 }
 
