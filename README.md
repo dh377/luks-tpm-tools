@@ -17,6 +17,10 @@ sudo ./install
 
 ## Tools
 
+### `key_read`
+
+You can test readability of your LUKS key in TPM device NVRAM or keyfile. (from terminal; This is actual script to read LUKS key during `initramfs` procedure.)
+
 ### `key_backup`
 
 This command generates an auto unlock USB key. You don't need to enter long passphrase when you unlock your system (if TPM PCR failed) or run `key_seal`.
