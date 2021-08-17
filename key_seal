@@ -49,8 +49,47 @@ dbg() {
   fi
 }
 
-# read password from console or with usplash
-# usage: readpass "prompt"
+detect_io_interfaces() {
+  # is plymouth available? default false
+  PLYMOUTH=$FALSE
+  if [ -x /bin/plymouth ] && plymouth --ping; then
+    PLYMOUTH=$TRUE
+  fi
+
+  # is usplash available? default false
+  USPLASH=$FALSE
+  # test for outfifo from Ubuntu Hardy cryptroot script, the second test
+  # alone proves not completely reliable.
+  if [ -p /dev/.initramfs/usplash_outfifo -a -x /sbin/usplash_write ]; then
+    # use innocuous command to determine if usplash is running
+    # usplash_write will return exit-code 1 if usplash isn't running
+    # need to set a flag to tell usplash_write to report no usplash
+    FAIL_NO_USPLASH=1
+    # enable verbose messages (required to display messages if kernel boot option "quiet" is enabled
+    /sbin/usplash_write "VERBOSE on"
+    if [ $? -eq $TRUE ]; then
+      # usplash is running
+      USPLASH=$TRUE
+      /sbin/usplash_write "CLEAR"
+    fi
+  fi
+
+  # is stty available? default false
+  STTY=$FALSE
+  STTYCMD=false
+  # check for stty executable
+  if [ -x /bin/stty ]; then
+    STTY=$TRUE
+    STTYCMD=/bin/stty
+  elif [ $( (
+    busybox stty >/dev/null 2>&1
+    echo $?
+  )) -eq $TRUE ]; then
+    STTY=$TRUE
+    STTYCMD="busybox stty"
+  fi
+}
+
 readpass() {
   if [ $# -gt 0 ]; then
     if [ $PLYMOUTH -eq $TRUE ]; then
@@ -60,9 +99,8 @@ readpass() {
       PASS="$(cat /dev/.initramfs/usplash_outfifo)"
     else
       [ $STTY -ne $TRUE ] && msg TEXT "WARNING stty not found, password will be visible"
-      echo -n "$1" >&2
       $STTYCMD -echo
-      read -r PASS </dev/console >/dev/null
+      read -rp "$1" PASS >/dev/null
       [ $STTY -eq $TRUE ] && echo >&2
       $STTYCMD echo
     fi
@@ -87,8 +125,12 @@ get_passphrase_from_usb() {
     USB_LOADED=0
 
     for SFS in $(ls -d $SDB/$(busybox basename $SDB)* $SDB 2>/dev/null); do
-      dbg TEXT ", *possible key device*" -n
       DEV=$(busybox basename $SFS)
+      if [ "$CRYPTTAB_SOURCE" = "/dev/${DEV}" ]; then
+        continue
+      fi        
+ 
+      dbg TEXT ", *possible key device*" -n
       # Check if key device itself is encrypted
       /sbin/cryptsetup isLuks /dev/${DEV} >/dev/null 2>&1
       ENCRYPTED=0$?
@@ -103,8 +145,7 @@ get_passphrase_from_usb() {
         DECRYPTED=1
         while [ $TRIES -gt 0 -a $DECRYPTED -ne 0 ]; do
           TRIES=$(($TRIES - 1))
-          prompt="Enter LUKS password for key device ${DEV} (${LABEL}) (or empty to skip): "
-          PASS=$(readpass "$prompt")
+          PASS=$(readpass "Enter LUKS password for key device ${DEV} (${LABEL}) (or empty to skip): ")
           if [ -z "$PASS" ]; then
             dbg TEXT ", device skipped" -n
             break
@@ -171,13 +212,10 @@ get_passphrase_from_usb() {
 # Add a key to LUKS
 add_key_luks() {
   local PASSPHRASE
-
   PASSPHRASE=$(get_passphrase_from_usb)
   if [ -z $PASSPHRASE ]; then
-    read -r -s -p "Enter any existing LUKS passphrase: " PASSPHRASE
-    echo
+    PASSPHRASE=$(readpass "Enter any existing LUKS passphrase: ")
   fi
-
   echo "Removing existing key from slot ${LUKS_KEYSLOT_SEAL}..."
   echo "${PASSPHRASE}" | cryptsetup luksKillSlot ${LUKS_ROOT_DEVICE} ${LUKS_KEYSLOT_SEAL}
   echo "Adding new key to slot ${LUKS_KEYSLOT_SEAL}..."
@@ -297,10 +335,16 @@ set_global_variables() {
   elif [ $_TPM_VERSION = "2" ]; then
     TPM_PCRS_ARG="${TPM_PCRS_ALGORITHM}:${TPM_PCRS}"
   fi
+
+  if [ -z "$CRYPTTAB_SOURCE" ]; then
+    CRYPTTAB_SOURCE_UUID=$(cat /etc/crypttab | awk '{print $2}')
+    CRYPTTAB_SOURCE=$(blkid -t $CRYPTTAB_SOURCE_UUID -o device)
+  fi
 }
 
 main() {
-  set_global_variables
+  set_global_variables "$@"
+  detect_io_interfaces
   create_ramfs
 
   generate_keyfile
