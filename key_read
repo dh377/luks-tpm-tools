@@ -87,9 +87,8 @@ readpass() {
       PASS="$(cat /dev/.initramfs/usplash_outfifo)"
     else
       [ $STTY -ne $TRUE ] && msg TEXT "WARNING stty not found, password will be visible"
-      echo -n "$1" >&2
       $STTYCMD -echo
-      read -r PASS </dev/console >/dev/null
+      read -rp "$1" PASS >/dev/null
       [ $STTY -eq $TRUE ] && echo >&2
       $STTYCMD echo
     fi
@@ -179,7 +178,7 @@ open_keyfile_from_tpm() {
 
   if [ $OPEN_STATUS -gt 0 ]; then
     if [ $_RUNNING_IN_INITRAMFS = $TRUE ]; then
-      dbg STATUS "oepn_keyfile_from_tpm: ERROR ($OPEN_STATUS)"
+      dbg STATUS "open_keyfile_from_tpm: ERROR ($OPEN_STATUS)"
     else
       if (echo "${OPEN_OUTPUT}" | grep "0x00000008" >/dev/null) || (echo "${OPEN_OUTPUT}" | grep "0x148" >/dev/null); then
         # TrouSerS: TPM_E_DISABLED_CMD (The target command has been disabled)
@@ -246,8 +245,11 @@ open_keyfile_from_removable() {
       USB_LOADED=$TRUE
 
       for SFS in $(ls -d $SDB/$(busybox basename $SDB)* $SDB 2>/dev/null); do
-        dbg TEXT ", *possible key device*" -n
         DEV=$(busybox basename $SFS)
+        if [ "$CRYPTTAB_SOURCE" = "/dev/${DEV}" ]; then
+          continue
+        fi        
+        dbg TEXT ", *possible key device*" -n
         # Check if key device itself is encrypted
         /sbin/cryptsetup isLuks /dev/${DEV} >/dev/null 2>&1
         ENCRYPTED=0$?
@@ -386,6 +388,11 @@ set_global_variables() {
     TPM_PCRS_ARG=`printf '%s\n' "-r$TPM_PCRS" | sed 's/,/ -r/g'`
   elif [ $_TPM_VERSION = "2" ]; then
     TPM_PCRS_ARG="${TPM_PCRS_ALGORITHM}:${TPM_PCRS}"
+  fi
+
+  if [ -z "$CRYPTTAB_SOURCE" ]; then
+    CRYPTTAB_SOURCE_UUID=$(cat /etc/crypttab | awk '{print $2}')
+    CRYPTTAB_SOURCE=$(blkid -t $CRYPTTAB_SOURCE_UUID -o device)
   fi
 
   _RUNNING_IN_INITRAMFS=$([ "$1" = "(keyscript)" ]; echo $?)
