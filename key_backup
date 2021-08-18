@@ -55,7 +55,7 @@ set_global_variables() {
   # LUKS (cryptsetup)
   LUKS_ROOT_DEVICE="$(find_luks_device)"
   LUKS_KEY_SIZE=32
-  LUKS_KEYSLOT_BACKUP="9"
+  LUKS_KEYSLOT_BACKUP="7"
 
   KEYFILE_NAME=".keyfile"
 
