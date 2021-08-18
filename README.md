@@ -11,10 +11,13 @@ This tool is compatible with TPM version **1.2** and **2**.
 
 ## Installation
 ```sh
-chmod +x ./install
 sudo ./install
-```
 
+# Options
+# -u, --uninstall    remove from your system.
+# -p, --purge        remove and delete /etc/default/luks-tpm-tools
+#     --pcrs <list>  define your own TPM_PCRS (e.g. "0,2,4,7,9")
+```
 ## Tools
 
 ### `key_read`
