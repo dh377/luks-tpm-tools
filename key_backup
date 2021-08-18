@@ -6,7 +6,9 @@ fi
 
 # Find first LUKS block device
 find_luks_device() {
-  lsblk -pfln -o NAME,FSTYPE | awk '/crypto_LUKS$/ {print $1}' | head -1
+  CRYPTTAB_SOURCE_UUID=$(cat /etc/crypttab | awk '{print $2}')
+  CRYPTTAB_SOURCE=$(blkid -t $CRYPTTAB_SOURCE_UUID -o device | head -1)
+  echo -n "$CRYPTTAB_SOURCE"
 }
 
 # usage: question "prompt" "default"
@@ -55,7 +57,7 @@ set_global_variables() {
   # LUKS (cryptsetup)
   LUKS_ROOT_DEVICE="$(find_luks_device)"
   LUKS_KEY_SIZE=32
-  LUKS_KEYSLOT_BACKUP="9"
+  LUKS_KEYSLOT_BACKUP="6"
 
   KEYFILE_NAME=".keyfile"
 

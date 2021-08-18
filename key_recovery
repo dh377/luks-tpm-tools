@@ -25,7 +25,9 @@ destroy_ramfs() {
 
 # Find first LUKS block device
 find_luks_device() {
-  lsblk -pfln -o NAME,FSTYPE | awk '/crypto_LUKS$/ {print $1}' | head -1
+  CRYPTTAB_SOURCE_UUID=$(cat /etc/crypttab | awk '{print $2}')
+  CRYPTTAB_SOURCE=$(blkid -t $CRYPTTAB_SOURCE_UUID -o device | head -1)
+  echo -n "$CRYPTTAB_SOURCE"
 }
 
 generate_recovery_key() {
@@ -74,7 +76,7 @@ set_global_variables() {
   LUKS_ROOT_DEVICE="$(find_luks_device)"
   LUKS_RECOVERY_KEY_SIZE="22"
   LUKS_RECOVERY_KEYSLOT="0"
-  LUKS_RECOVERY_KEYSLOT_TEMPORARY="10"
+  LUKS_RECOVERY_KEYSLOT_TEMPORARY="7"
 
   MOUNTPOINT_RAMFS=/tmp/ramfs
   KEYFILE_NAME=".keyfile"

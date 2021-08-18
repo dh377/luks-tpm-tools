@@ -61,7 +61,7 @@ install_common() {
   if [ ! -f /etc/default/luks-tpm-tools ]; then
     cp default /etc/default/luks-tpm-tools
   fi
-  
+
   if [ $PCRS ]; then
     sed -i 's|^[#\s]*\(TPM_PCRS=\).*$|\1"'"$PCRS"'"|' /etc/default/luks-tpm-tools
   fi
@@ -75,25 +75,27 @@ install_common() {
   update-initramfs -u
 }
 uninstall_common() {
-    if [ "$MODE" = "purge" ]; then
-      rm /etc/default/luks-tpm-tools
-    fi
+  if [ "$MODE" = "purge" ]; then
+    rm /etc/default/luks-tpm-tools
+  fi
 
-    sed -i 's|(keyscript)|none|;s|,keyscript=/usr/sbin/key_read||' /etc/crypttab
+  sed -i 's|(keyscript)|none|;s|,keyscript=/usr/sbin/key_read||' /etc/crypttab
+
+  update-initramfs -u
 }
 
 global_variables() {
   VERSION=$(get_tpm_version)
   MODE='install'
   case "$1" in
-    -u)
+    -u|--uninstall)
       MODE='uninstall'
       ;;
-    -p)
+    -p|--purge)
       # will also remove all configurations.
       MODE='purge'
       ;;
-    -pcrs)
+    --pcrs)
       PCRS="$2"
       ;;
     *)
@@ -103,7 +105,7 @@ global_variables() {
 
 main() {
   global_variables "$@"
-  
+
   if [ $VERSION = 0 ]; then
   	echo "You have to install any 'tpm*-tools' coording to your TPM hardware."
   	exit 1
